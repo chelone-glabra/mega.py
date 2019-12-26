@@ -1,9 +1,13 @@
+import io
 import re
 import json
 import logging
 import secrets
+from io import BytesIO
 from pathlib import Path
 import hashlib
+from time import sleep
+
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 from Crypto.Util import Counter
@@ -14,6 +18,7 @@ import tempfile
 import shutil
 
 import requests
+from requests import Response
 from tenacity import retry, wait_exponential, retry_if_exception_type
 
 from .errors import ValidationError, RequestError
@@ -73,7 +78,7 @@ class Mega:
             user_hash = base64_url_encode(pbkdf2_key[-16:])
         resp = self._api_request({'a': 'us', 'user': email, 'uh': user_hash})
         if isinstance(resp, int):
-            raise RequestError(resp)
+            raise errors.RequestError(resp)
         self._login_process(resp, password_aes)
 
     def login_anonymous(self):
@@ -85,21 +90,21 @@ class Mega:
         user = self._api_request(
             {
                 'a':
-                'up',
+                    'up',
                 'k':
-                a32_to_base64(encrypt_key(master_key, password_key)),
+                    a32_to_base64(encrypt_key(master_key, password_key)),
                 'ts':
-                base64_url_encode(
-                    a32_to_str(session_self_challenge) + a32_to_str(
-                        encrypt_key(session_self_challenge, master_key)
+                    base64_url_encode(
+                        a32_to_str(session_self_challenge) + a32_to_str(
+                            encrypt_key(session_self_challenge, master_key)
+                        )
                     )
-                )
             }
         )
 
         resp = self._api_request({'a': 'us', 'user': user})
         if isinstance(resp, int):
-            raise RequestError(resp)
+            raise errors.RequestError(resp)
         self._login_process(resp, password_key)
 
     def _login_process(self, resp, password):
@@ -167,7 +172,7 @@ class Mega:
                 msg = 'Request failed, retrying'
                 logger.info(msg)
                 raise RuntimeError(msg)
-            raise RequestError(json_resp)
+            raise errors.RequestError(json_resp)
         return json_resp[0]
 
     def _parse_url(self, url):
@@ -177,7 +182,7 @@ class Mega:
             path = match[0]
             return path
         else:
-            raise RequestError('Url key missing')
+            raise errors.RequestError('Url key missing')
 
     def _process_file(self, file, shared_keys):
         if file['t'] == 0 or file['t'] == 1:
@@ -284,9 +289,9 @@ class Mega:
             if foldername != '':
                 for file in files.items():
                     if (
-                        file[1]['a'] and
-                        file[1]['t'] and
-                        file[1]['a']['n'] == foldername
+                            file[1]['a'] and
+                            file[1]['t'] and
+                            file[1]['a']['n'] == foldername
                     ):
                         if parent_desc == file[1]['p']:
                             parent_desc = file[0]
@@ -314,23 +319,23 @@ class Mega:
                     parent_dir_name, files=files
                 )
                 if (
-                    filename and parent_node_id and
-                    file[1]['a'] and file[1]['a']['n'] == filename and
-                    parent_node_id == file[1]['p']
+                        filename and parent_node_id and
+                        file[1]['a'] and file[1]['a']['n'] == filename and
+                        parent_node_id == file[1]['p']
                 ):
                     if (
-                        exclude_deleted and
-                        self._trash_folder_node_id == file[1]['p']
+                            exclude_deleted and
+                            self._trash_folder_node_id == file[1]['p']
                     ):
                         continue
                     return file
             if (
-                filename and
-                file[1]['a'] and file[1]['a']['n'] == filename
+                    filename and
+                    file[1]['a'] and file[1]['a']['n'] == filename
             ):
                 if (
-                    exclude_deleted and
-                    self._trash_folder_node_id == file[1]['p']
+                        exclude_deleted and
+                        self._trash_folder_node_id == file[1]['p']
                 ):
                     continue
                 return file
@@ -378,7 +383,7 @@ class Mega:
         if 'h' in file and 'k' in file:
             public_handle = self._api_request({'a': 'l', 'n': file['h']})
             if public_handle == -11:
-                raise RequestError(
+                raise errors.RequestError(
                     "Can't get a public link from that file "
                     "(is this a shared file?)"
                 )
@@ -388,7 +393,7 @@ class Mega:
                 f'/#!{public_handle}!{decrypted_key}'
             )
         else:
-            raise ValidationError('File id and key must be present')
+            raise errors.ValidationError('File id and key must be present')
 
     def _node_data(self, node):
         try:
@@ -404,7 +409,7 @@ class Mega:
         if 'h' in file and 'k' in file:
             public_handle = self._api_request({'a': 'l', 'n': file['h']})
             if public_handle == -11:
-                raise RequestError(
+                raise errors.RequestError(
                     "Can't get a public link from that file "
                     "(is this a shared file?)"
                 )
@@ -414,7 +419,7 @@ class Mega:
                 f'/#F!{public_handle}!{decrypted_key}'
             )
         else:
-            raise ValidationError('File id and key must be present')
+            raise errors.ValidationError('File id and key must be present')
 
     def get_user(self):
         user_data = self._api_request({'a': 'ug'})
@@ -577,6 +582,92 @@ class Mega:
             is_public=False
         )
 
+    def download_memory(self, file):
+        """
+
+        :rtype: BytesIO
+        """
+        file_object = file[1]
+        file_data = self._api_request({'a': 'g', 'g': 1, 'n': file_object['h']})
+        k = file_object['k']
+        iv = file_object['iv']
+        meta_mac = file_object['meta_mac']
+
+        byte_f = io.BytesIO(b"")
+
+        # Seems to happens sometime... When this occurs, files are
+        # inaccessible also in the official also in the official web app.
+        # Strangely, files can come back later.
+        if 'g' not in file_data:
+            raise errors.RequestError('File not accessible anymore')
+        file_url = file_data['g']
+        file_size = file_data['s']
+        attribs = base64_url_decode(file_data['at'])
+        attribs = decrypt_attr(attribs, k)
+
+        input_file = requests.get(file_url, stream=True).raw
+
+        k_str = a32_to_str(k)
+        counter = Counter.new(
+            128, initial_value=((iv[0] << 32) + iv[1]) << 64
+        )
+        aes = AES.new(k_str, AES.MODE_CTR, counter=counter)
+
+        mac_str = '\0' * 16
+        mac_encryptor = AES.new(k_str, AES.MODE_CBC, mac_str)
+        iv_str = a32_to_str([iv[0], iv[1], iv[0], iv[1]])
+
+        for chunk_start, chunk_size in get_chunks(file_size):
+            chunk = input_file.read(chunk_size)
+            chunk = aes.decrypt(chunk)
+            # temp_output_file.write(chunk)
+            byte_f.write(chunk)
+
+            encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
+            for i in range(0, len(chunk) - 16, 16):
+                block = chunk[i:i + 16]
+                encryptor.encrypt(block)
+
+            # fix for files under 16 bytes failing
+            if file_size > 16:
+                i += 16
+            else:
+                i = 0
+
+            block = chunk[i:i + 16]
+            if len(block) % 16:
+                block += b'\0' * (16 - (len(block) % 16))
+            mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
+
+            # file_info = os.stat(temp_output_file.name)
+            # logger.info(
+            #     '%s of %s downloaded', file_info.st_size, file_size
+            # )
+        file_mac = str_to_a32(mac_str)
+        # check mac integrity
+        if (
+                file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3]
+        ) != meta_mac:
+            raise ValueError('Mismatched mac')
+        # output_path = Path(dest_path + file_name)
+        #
+        # retry_count = 3
+        #
+        # for i in range(1, retry_count + 1):
+        #     try:
+        #         shutil.move(temp_output_file.name, output_path)
+        #     except FileNotFoundError as e:
+        #         print(f"error {e} occured. retry:{i}/{retry_count}")
+        #         sleep(i * 4)
+        #     else:
+        #         return output_path
+        #
+        # raise Exception("Retry count is reach to limit.")
+
+        #  output_path
+
+        return byte_f
+
     def _export_file(self, node):
         node_data = self._node_data(node)
         self._api_request([
@@ -603,7 +694,7 @@ class Mega:
             try:
                 # If already exported
                 return self.get_folder_link(node)
-            except (RequestError, KeyError):
+            except (errors.RequestError, KeyError):
                 pass
 
         master_key_cipher = AES.new(a32_to_str(self.master_key), AES.MODE_ECB)
@@ -655,13 +746,13 @@ class Mega:
         )
 
     def _download_file(
-        self,
-        file_handle,
-        file_key,
-        dest_path=None,
-        dest_filename=None,
-        is_public=False,
-        file=None
+            self,
+            file_handle,
+            file_key,
+            dest_path=None,
+            dest_filename=None,
+            is_public=False,
+            file=None
     ):
         if file is None:
             if is_public:
@@ -698,7 +789,7 @@ class Mega:
         # inaccessible also in the official also in the official web app.
         # Strangely, files can come back later.
         if 'g' not in file_data:
-            raise RequestError('File not accessible anymore')
+            raise errors.RequestError('File not accessible anymore')
         file_url = file_data['g']
         file_size = file_data['s']
         attribs = base64_url_decode(file_data['at'])
@@ -717,7 +808,7 @@ class Mega:
             dest_path += '/'
 
         with tempfile.NamedTemporaryFile(
-            mode='w+b', prefix='megapy_', delete=False
+                mode='w+b', prefix='megapy_', delete=False
         ) as temp_output_file:
             k_str = a32_to_str(k)
             counter = Counter.new(
@@ -757,12 +848,25 @@ class Mega:
             file_mac = str_to_a32(mac_str)
             # check mac integrity
             if (
-                file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3]
+                    file_mac[0] ^ file_mac[1], file_mac[2] ^ file_mac[3]
             ) != meta_mac:
                 raise ValueError('Mismatched mac')
             output_path = Path(dest_path + file_name)
-            shutil.move(temp_output_file.name, output_path)
-            return output_path
+
+            retry_count = 3
+
+            for i in range(1, retry_count + 1):
+                try:
+                    shutil.move(temp_output_file.name, output_path)
+                except FileNotFoundError as e:
+                    print(f"error {e} occured. retry:{i}/{retry_count}")
+                    sleep(i * 4)
+                else:
+                    return output_path
+
+            raise Exception("Retry count is reach to limit.")
+
+            #  output_path
 
     def upload(self, filename, dest=None, dest_filename=None):
         # determine storage node
@@ -968,7 +1072,7 @@ class Mega:
         # determine target_node_id
         if type(target) == int:
             target_node_id = str(self.get_node_by_type(target)[0])
-        elif type(target) in (str, ):
+        elif type(target) in (str,):
             target_node_id = target
         else:
             file = target[1]
@@ -1003,10 +1107,10 @@ class Mega:
         elif add is False:
             l = '0'  # remove command
         else:
-            raise ValidationError('add parameter must be of type bool')
+            raise errors.ValidationError('add parameter must be of type bool')
 
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-            ValidationError('add_contact requires a valid email address')
+            errors.ValidationError('add_contact requires a valid email address')
         else:
             return self._api_request(
                 {
@@ -1039,7 +1143,7 @@ class Mega:
         """
         data = self._api_request({'a': 'g', 'p': file_handle, 'ssm': 1})
         if isinstance(data, int):
-            raise RequestError(data)
+            raise errors.RequestError(data)
 
         if 'at' not in data or 's' not in data:
             raise ValueError("Unexpected result", data)
@@ -1057,7 +1161,7 @@ class Mega:
         return result
 
     def import_public_file(
-        self, file_handle, file_key, dest_node=None, dest_name=None
+            self, file_handle, file_key, dest_node=None, dest_name=None
     ):
         """
         Import the public file into user account
